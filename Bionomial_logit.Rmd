@@ -1,0 +1,300 @@
+---
+
+References: Apollo website http://www.apollochoicemodelling.com/examples.html
+Libraries: This following libraries are needed 
+--> **dplyr:**  for data manipulation (just in case you want to perform additional data transformation) 
+--> **apollo:** model estimation 
+
+```{r}
+#Clear environment
+rm(list = ls())
+getwd() #The working directory is set to the notwbook file location
+```
+
+Install and load required libraries
+```{r}
+#Install and load in packages 
+pacman::p_load(dplyr, readxl, apollo)
+```
+
+Import the data to clean 
+```{r}
+df_hh <- read.csv("Data/household.csv")
+df_veh <- read.csv("Data/vehicle.csv")
+```
+
+Explore the data
+```{r}
+#list of all variables in the data
+ls(df_hh)
+unique(df_hh$HOME_STATE_FIPS)
+```
+
+Format the data as required for the analysis
+```{r}
+#Selecting the variables we need and subset the data to the required geographic area
+df_hh_main <- df_hh %>%
+  select(HOUSEHOLD_ID, HOME_STATE_FIPS, HOME_TYPE, HOME_OWNERSHIP, HHSIZE, NUMSTUDENTS , NUMDRIVERS, NUMWORKERS, NUMVEHICLE, NUMBICYCLE, HH_INCOME_DETAILED) %>%
+subset(HOME_STATE_FIPS==24)
+
+unique(df_hh_main$NUMVEHICLE)
+df_hh_main$NUMVEHICLE[df_hh_main$NUMVEHICLE > 3] <- 3
+
+#Frequency of each unique value in a varible
+table(df_hh_main$NUMVEHICLE)
+
+table(df_hh_main$HOME_TYPE)
+table(df_hh_main$HOME_OWNERSHIP)
+table(df_hh_main$HHSIZE)
+table(df_hh_main$NUMSTUDENTS)
+table(df_hh_main$NUMDRIVERS)
+table(df_hh_main$NUMWORKERS)
+table(df_hh_main$HH_INCOME_DETAILED)
+table(df_hh_main$NUMBICYCLE)
+
+df_hh_main <- df_hh_main %>%
+  subset(HOME_TYPE>0) %>%
+  subset(HOME_OWNERSHIP>0) %>%
+  subset(NUMBICYCLE>=0)
+
+df_hh_main$HHSIZE[df_hh_main$HHSIZE > 6] <- 6
+df_hh_main$NUMSTUDENTS[df_hh_main$NUMSTUDENTS > 4] <- 4
+df_hh_main$NUMDRIVERS[df_hh_main$NUMDRIVERS > 4] <- 4
+df_hh_main$NUMWORKERS[df_hh_main$NUMWORKERS > 4] <- 4
+
+df_hh_main <- df_hh_main %>% mutate(SF_DUMMY = case_when(HOME_TYPE <= 2 ~ 1,
+                           TRUE ~ 0))
+```
+#Model Estimation: MNL model of vehicle ownership with generic coefficients
+
+**Step-1:** Initialize the apollo package, set core controls and load the data
+```{r}
+### Initialise code
+apollo_initialise()
+
+### Set core controls
+apollo_control = list(
+  modelName       = "MNL_V1",
+  modelDescr      = "Choice of owning 0,1,2,3+ cars",
+  indivID         = "HOUSEHOLD_ID", 
+  outputDirectory = "output"
+)
+
+# ################################################################# #
+#### LOAD DATA AND APPLY ANY TRANSFORMATIONS                     ####
+# ################################################################# #
+
+### Loading data from package
+### if data is to be loaded from a file (e.g. called data.csv), 
+### the code would be: database = read.csv("data.csv",header=TRUE)
+database <- df_hh_main
+```
+
+**Step-2:** Define the Betas that will be used in the model. It is done with the apollo_beta function, which arguments are:
+
+- **Name for report. Typically, the same as the variable**
+
+- **Estimate/Fix the parameter (0/1)**
+
+Note that in this example we are using generic coefficients for all variables
+
+```{r}
+### Vector of parameters, including any that are kept fixed in estimation
+apollo_beta=c(asc_ev0              = 0,
+              asc_ev1              = 0,
+              asc_ev2              = 0,
+              asc_ev3              = 0,
+
+              b_income             = 0,
+              b_workers            = 0,
+              b_sf_home            = 0,
+              b_bicycle            = 0)
+
+### Vector with names (in quotes) of parameters to be kept fixed at their starting value in apollo_beta, use apollo_beta_fixed = c() if none
+apollo_fixed = c("asc_ev0")
+
+# ################################################################# #
+#### GROUP AND VALIDATE INPUTS                                   ####
+# ################################################################# #
+
+apollo_inputs = apollo_validateInputs()
+```
+**Step-3:** Step-7. The following comands define which model will be estimating since we will define the loglikelihood function. We dont need to write its mathematical expression, but we will have to correctly indicate the elements of the specific model that we want to use.
+
+**Step-4:** Define the Utility functions and assign the choices to their correspondent utilities
+
+```{r}
+# ################################################################# #
+#### DEFINE MODEL AND LIKELIHOOD FUNCTION                        ####
+# ################################################################# #
+
+apollo_probabilities=function(apollo_beta, apollo_inputs, functionality="estimate"){
+  
+  ### Attach inputs and detach after function exit
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(apollo_detach(apollo_beta, apollo_inputs))
+  
+  ### Create list of probabilities P
+  P = list()
+  
+### List of utilities: these must use the same names as in mnl_settings, order is irrelevant
+  V = list()
+  V[['nocar']]  = asc_ev0  
+  V[['onecar']]    = asc_ev1 + b_income * HH_INCOME_DETAILED + b_workers * NUMWORKERS + b_sf_home * SF_DUMMY + b_bicycle * NUMBICYCLE
+  V[['twocars']]    = asc_ev2 + b_income * HH_INCOME_DETAILED + b_workers * NUMWORKERS + b_sf_home * SF_DUMMY + b_bicycle * NUMBICYCLE
+  V[['threecars']]    = asc_ev3 + b_income * HH_INCOME_DETAILED + b_workers * NUMWORKERS + b_sf_home * SF_DUMMY + b_bicycle * NUMBICYCLE
+  
+    ### Define settings for NL model
+  mnl_settings <- list(
+    alternatives = c(nocar=0, onecar=1, twocars=2, threecars=3),
+    avail        = list(nocar=1, onecar=1, twocars=1, threecars=1), 
+    choiceVar    = NUMVEHICLE,
+    utilities    = V
+  )
+  
+  ### Compute probabilities using NL model
+  P[["model"]] = apollo_mnl(mnl_settings, functionality)
+  
+  ### Prepare and return outputs of function
+  P = apollo_prepareProb(P, apollo_inputs, functionality)
+  return(P)
+}
+```
+
+
+#Estimation and Results
+
+The following command starts the estimation of the Beta parameters that minimize the loglikelihood function.
+
+Depending on the model, this estimation can take seconds, minutes, or hours... Apollo estimates Logit models in seconds.
+
+```{r}
+# ################################################################# #
+#### MODEL ESTIMATION                                            ####
+# ################################################################# #
+
+model = apollo_estimate(apollo_beta, apollo_fixed, apollo_probabilities, apollo_inputs)
+```
+
+
+
+```{r}
+# ################################################################# #
+#### MODEL OUTPUTS                                               ####
+# ################################################################# #
+
+
+# ----------------------------------------------------------------- #
+#---- FORMATTED OUTPUT (TO SCREEN)                               ----
+# ----------------------------------------------------------------- #
+
+apollo_modelOutput(model,modelOutput_settings = list(printT1=1))
+
+# ----------------------------------------------------------------- #
+#---- FORMATTED OUTPUT (TO FILE, using model name)               ----
+# ----------------------------------------------------------------- #
+
+apollo_saveOutput(model,saveOutput_settings = list(printT1=1))
+```
+
+#Example-2: MNL model with alternative specific coefficients
+
+
+```{r}
+### Initialise code
+apollo_initialise()
+
+### Set core controls
+apollo_control = list(
+  modelName       = "MNL_V2",
+  modelDescr      = "Choice of owning 0,1,2,3+ cars",
+  indivID         = "HOUSEHOLD_ID", 
+  outputDirectory = "output"
+)
+
+# ################################################################# #
+#### LOAD DATA AND APPLY ANY TRANSFORMATIONS                     ####
+# ################################################################# #
+
+database <- df_hh_main
+
+### Vector of parameters, including any that are kept fixed in estimation
+apollo_beta=c(asc_ev0              = 0,
+              asc_ev1              = 0,
+              asc_ev2              = 0,
+              asc_ev3              = 0,
+
+              b_income1             = 0,
+              b_workers1            = 0,
+              b_sf_home1            = 0,
+              b_bicycle1            = 0,
+              
+              b_income2             = 0,
+              b_workers2            = 0,
+              b_sf_home2            = 0,
+              b_bicycle2            = 0,
+              
+              b_income3             = 0,
+              b_workers3            = 0,
+              b_sf_home3            = 0,
+              b_bicycle3            = 0)
+
+### Vector with names (in quotes) of parameters to be kept fixed at their starting value in apollo_beta, use apollo_beta_fixed = c() if none
+apollo_fixed = c("asc_ev0")
+
+# ################################################################# #
+#### GROUP AND VALIDATE INPUTS                                   ####
+# ################################################################# #
+
+apollo_inputs = apollo_validateInputs()
+
+
+# ################################################################# #
+#### DEFINE MODEL AND LIKELIHOOD FUNCTION                        ####
+# ################################################################# #
+
+apollo_probabilities=function(apollo_beta, apollo_inputs, functionality="estimate"){
+  
+  ### Attach inputs and detach after function exit
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(apollo_detach(apollo_beta, apollo_inputs))
+  
+  ### Create list of probabilities P
+  P = list()
+  
+### List of utilities: these must use the same names as in mnl_settings, order is irrelevant
+  V = list()
+  V[['nocar']]  = asc_ev0  
+  V[['onecar']]    = asc_ev1 + b_income1 * HH_INCOME_DETAILED + b_workers1 * NUMWORKERS + b_sf_home1 * SF_DUMMY + b_bicycle1 * NUMBICYCLE
+  V[['twocars']]    = asc_ev2 + b_income2 * HH_INCOME_DETAILED + b_workers2 * NUMWORKERS + b_sf_home2 * SF_DUMMY + b_bicycle2 * NUMBICYCLE
+  V[['threecars']]    = asc_ev3 + b_income3 * HH_INCOME_DETAILED + b_workers3 * NUMWORKERS + b_sf_home3 * SF_DUMMY + b_bicycle3 * NUMBICYCLE
+  
+    ### Define settings for NL model
+  mnl_settings <- list(
+    alternatives = c(nocar=0, onecar=1, twocars=2, threecars=3),
+    avail        = list(nocar=1, onecar=1, twocars=1, threecars=1), 
+    choiceVar    = NUMVEHICLE,
+    utilities    = V
+  )
+  
+  ### Compute probabilities using NL model
+  P[["model"]] = apollo_mnl(mnl_settings, functionality)
+  
+  ### Prepare and return outputs of function
+  P = apollo_prepareProb(P, apollo_inputs, functionality)
+  return(P)
+}
+
+# ################################################################# #
+#### MODEL ESTIMATION                                            ####
+# ################################################################# #
+
+model = apollo_estimate(apollo_beta, apollo_fixed, apollo_probabilities, apollo_inputs)
+
+# ----------------------------------------------------------------- #
+#---- FORMATTED OUTPUT (TO SCREEN)                               ----
+# ----------------------------------------------------------------- #
+
+apollo_modelOutput(model,modelOutput_settings = list(printT1=1))
+```
+
