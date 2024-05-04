@@ -1,0 +1,267 @@
+```{r}
+install.packages("easycensus")
+install.packages("ipfr")
+install.packages("dplyr")
+install.packages("tidycensus")
+install.packages("tidyverse")
+```
+
+
+```{r}
+library(easycensus)
+library(ipfr)
+library(dplyr)
+library(tidycensus)
+library(tidyverse)
+```
+
+```{r}
+#This example is about creating a synthetic population for Anne Arundel County in Maryland using the Iterative Proportional Fitting (IPF) method. The county's population is around 540,000, and we will utilize ACS samples as the source data, with the 2020 US Census data serving as the target data. The variables of interest for this synthetic population are 'Gender (SEX)' and 'Race (RAC1P).
+```
+
+```{r}
+# Example: Obtain totals (Marginals) for person's RACE in Maryland. 
+
+#Search if it exist in Census Data:
+cens_find_dec("RACE") #P3
+
+#Download the table:
+P3<-cens_get_dec(table = "P3",geo = NULL,county = "Anne Arundel",state="Maryland",drop_total=TRUE)
+
+#Clean the data: Aggregate and find totals for each census tract data per 'SEX'
+RACE_TOT<-
+  P3%>%
+  select(race,value)%>%
+  rename(total=value)
+
+#Check the total population
+sum(RACE_TOT$total) #Close enough 
+
+#https://api.census.gov/data/2010/dec/pl/groups/P3.html
+```
+```{r}
+# Example: Obtain totals (Marginals) for person's Gender in Maryland
+
+#Search if it exist in Census Data:
+cens_find_dec("sex") #PCT12 
+
+PCT12<-cens_get_dec(table = "PCT12",geo = NULL,county = "Anne Arundel",state="Maryland",drop_total=TRUE)
+
+#Check the total population
+sum(PCT12$value) #1075312 almost the double, let's check why
+
+unique(PCT12$race_ethnicity) #There are 16 race categories here. Let's check the ACS Dictionary
+#https://www2.census.gov/programs-surveys/acs/tech_docs/pums/data_dict/PUMS_Data_Dictionary_2021.pdf
+
+PCT12<-
+  PCT12%>%
+  filter(race_ethnicity%in%c(
+    "white alone",
+    "black or african american alone",
+    "american indian and alaska native alone",
+    "asian alone",
+    "native hawaiian and other pacific islander alone",
+    "some other race alone",
+    "two or more races"
+  ))
+
+#Check the total population
+sum(PCT12$value) #537656 close enough
+
+#Aggregate totals as needed:
+SEX_TOT<-
+  PCT12%>%
+  group_by(sex)%>%
+  summarise(total = sum(value))
+
+```
+
+
+```{r}
+#Load the sample for 'Anne Arundel' county. Here use the year of 2021
+#Remember that the ACS sample available at PUMA level.
+#PUMAs here: 1201 1202 1203 1204
+
+ACS_P_Sample <-
+  get_pums(variables = c("SEX","RAC1P"),
+         state = "MD",
+         puma = c("MD" = "01201","MD" = "01202","MD" = "01203","MD" = "01204"),
+         year = 2021,
+         survey = "acs1")
+
+#Check the provided weight
+sum(ACS_P_Sample$PWGTP)
+```
+
+```{r}
+#Make consistent variable categories between the source and target
+
+#check the variables categories in the target:
+sort(unique(ACS_P_Sample$RAC1P))
+
+#Check the variable categories in the source
+unique(RACE_TOT$race)
+
+#Re-code variable names (refer to ACS dictionary)
+RACE_TOT_RECODED<-
+  RACE_TOT%>%
+  mutate(race=case_when(
+    race=="white alone"~1,
+    race=="black or african american alone"~2,
+    race=="american indian and alaska native alone"~3,
+    race=="asian alone"~4,
+    race=="native hawaiian and other pacific islander alone"~5,
+    race=="some other race alone"~6,
+    race=="two or more races"~7
+  ))%>%
+  arrange(race)%>%
+  spread(1,2) #Add this to be compatible with 'iprf' package
+
+SEX_TOT_RECODED<-
+  SEX_TOT%>%
+  mutate(sex=case_when(
+    sex=="male"~1,
+    sex=="female"~2
+  ))%>%
+  spread(1,2)
+
+#Now still we have 9 categories for RACE in the sample and 7 in the target, let's fix that too:
+#https://www2.census.gov/programs-surveys/acs/tech_docs/pums/data_dict/PUMS_Data_Dictionary_2021.pdf
+source<-
+  ACS_P_Sample%>%
+  select(SEX,RAC1P)%>%
+  mutate(RAC1P=case_when(
+    RAC1P==1~1,
+    RAC1P==2~2,
+    RAC1P%in%c(3,4,5)~3,
+    RAC1P==6~4,
+    RAC1P==7~5,
+    RAC1P==8~6,
+    RAC1P==9~7
+  ))
+```
+```{r}
+#After we obtained the sample and the target we need to prepare them for 'iprf' package:
+#The source should have only the variables needed in the final synthetic populaion
+source
+
+#The target should include all total tables, and they should be arranged in the same order as each corresponding variable in the source file. Here SEX then RAC1P
+
+#Create a new list
+targets <- list()
+
+#Add the totals for 'SEX'
+targets[[length(targets) + 1]] <- SEX_TOT_RECODED
+names(targets)[length(targets)] <-"SEX"
+
+#Add the totals for 'RACE'
+targets[[length(targets) + 1]] <- RACE_TOT_RECODED
+names(targets)[length(targets)] <-"RAC1P"
+```
+
+```{r}
+result <- ipu(source, targets)
+
+#Check the total weight:
+sum(result$weight_tbl$weight)
+```
+```{r}
+#Evaluation
+source_cdf<-
+  source%>%
+  group_by(SEX)%>%
+  summarise(n=n())%>%
+  mutate(f=n/sum(n))%>%
+  select(SEX,f)%>%
+  mutate(Data="Source")
+
+target_cdf<-
+  SEX_TOT%>%
+  mutate(sex=case_when(
+    sex=="male"~1,
+    sex=="female"~2
+  ))%>%
+  mutate(f=total/sum(total))%>%
+  rename(SEX=1)%>%
+  select(SEX,f)%>%
+  mutate(Data="Target")
+
+
+syn_pop_cdf<-
+  result$weight_dist$data%>%
+  group_by(SEX)%>%
+  summarise(n=sum(weight))%>%
+  mutate(f=n/sum(n))%>%
+  rename(SEX=1)%>%
+  select(SEX,f)%>%
+  mutate(Data="SYN_POP")
+
+
+age_cdfs<-rbind(source_cdf,target_cdf,syn_pop_cdf)
+  
+
+# Specify the order of levels for the Data variable
+age_cdfs$Data <- factor(age_cdfs$Data, levels = c("Source", "Target", "SYN_POP"))
+
+# Creating the plot
+ggplot(age_cdfs, aes(x = factor(SEX), y = f, fill = Data)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Bar Chart",
+       x = "SEX",
+       y = "Value") +
+  theme_classic()
+```
+
+
+```{r}
+#Evaluation
+source_cdf<-
+  source%>%
+  group_by(RAC1P)%>%
+  summarise(n=n())%>%
+  mutate(f=n/sum(n))%>%
+  select(RAC1P,f)%>%
+  mutate(Data="Source")
+
+target_cdf<-
+  RACE_TOT%>%
+  mutate(race=case_when(
+    race=="white alone"~1,
+    race=="black or african american alone"~2,
+    race=="american indian and alaska native alone"~3,
+    race=="asian alone"~4,
+    race=="native hawaiian and other pacific islander alone"~5,
+    race=="some other race alone"~6,
+    race=="two or more races"~7
+  ))%>%
+  arrange(race)%>%
+  mutate(f=total/sum(total))%>%
+  rename(RAC1P=1)%>%
+  select(RAC1P,f)%>%
+  mutate(Data="Target")
+
+
+syn_pop_cdf<-
+  result$weight_dist$data%>%
+  group_by(RAC1P)%>%
+  summarise(n=sum(weight))%>%
+  mutate(f=n/sum(n))%>%
+  rename(RAC1P=1)%>%
+  select(RAC1P,f)%>%
+  mutate(Data="SYN_POP")
+
+
+age_cdfs<-rbind(source_cdf,target_cdf,syn_pop_cdf)
+  
+
+# Specify the order of levels for the Data variable
+age_cdfs$Data <- factor(age_cdfs$Data, levels = c("Source", "Target", "SYN_POP"))
+
+# Creating the plot
+ggplot(age_cdfs, aes(x = factor(RAC1P), y = f, fill = Data)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Bar Chart",
+       x = "RACE",
+       y = "Value") +
+  theme_classic()
+```
